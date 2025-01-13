@@ -78,7 +78,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 4096  # Increase from 256 to handle longer sequences
-    vocab_size: int = 5
+    vocab_size: int = 25
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -169,8 +169,8 @@ class DataLoaderLite:
     def __init__(self, 
                  B, T, 
                  process_rank, num_processes, 
-                 bed_file='data/human-sequences.bed', 
-                 fasta_file='data/hg38.ml.fa', 
+                 bed_file='data/uniprot/bed_uniprot.bed', 
+                 fasta_file='data/uniprot/uniprot_sprot.fasta', 
                  split='train'):
         self.B = B
         self.T = T
@@ -178,8 +178,12 @@ class DataLoaderLite:
         self.num_processes = num_processes
         self.master_process = (self.process_rank == 0)
 
-        # Prepare the DNA -> integer mapping
-        self.chars = ['A', 'C', 'G', 'T', 'N']
+        # Prepare the Amino Acid -> integer mapping
+        self.chars = [
+            'A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
+            'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y',
+            'B', 'Z', 'X', 'U', 'O'
+        ]  # Includes standard and ambiguous amino acids
         self.stoi = {ch: i for i, ch in enumerate(self.chars)}
 
         # 1) Load BED and filter by split
@@ -356,7 +360,7 @@ if __name__ == "__main__":
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
-    val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="valid")
+    #val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="valid") #maybe clustering to build a proper val set later
 
     torch.set_float32_matmul_precision('high')
 
@@ -418,7 +422,7 @@ if __name__ == "__main__":
         t0 = time.time()
         last_step = (step == max_steps - 1)
         # ----------- (1) Validation every N steps -----------
-        if step % 100 == 0:
+        if step % 100 == 0 and 'val_loader' in locals():
             model.eval()
             val_loader.reset()
 
