@@ -169,8 +169,8 @@ class DataLoaderLite:
     def __init__(self, 
                  B, T, 
                  process_rank, num_processes, 
-                 bed_file='data/uniprot/bed_uniprot.bed', 
-                 fasta_file='data/uniprot/uniprot_sprot.fasta', 
+                 bed_file='data/uniref50/bed_uniref50.bed', 
+                 fasta_file='data/uniref50/uniref50.fasta', 
                  split='train'):
         self.B = B
         self.T = T
@@ -198,7 +198,9 @@ class DataLoaderLite:
         self.num_regions = len(self.regions)
 
         # 3) Open FASTA with pyfaidx
-        self.fasta = Fasta(fasta_file, as_raw=True)  # as_raw=True => returns a plain Python string
+        self.fasta = Fasta(fasta_file, 
+                           as_raw=True,
+                           read_ahead=False)  
 
         # 4) Offsets: track how far we have consumed each region (local to this rank’s subset)
         self.region_offsets = []
@@ -346,6 +348,7 @@ if __name__ == "__main__":
     # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
     init_from = "resume"  # or "scratch"
     best_val_loss = float('inf')
+    best_train_loss = float('inf')
     save_interval = 100
 
     #total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
@@ -499,5 +502,25 @@ if __name__ == "__main__":
             print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(tsv_path, 'a') as f:
                 f.write(f"{step}\t{loss_accum.item()}\t{norm:.4f}\t{lr:.4e}\ttrain\t{current_run_time}_checkpoint\n")
+
+            # for train checkpoint]
+            if step % 100 == 0:
+                # same style as validation checkpoint logging
+                train_loss_value = loss_accum.item()
+                print(f"step {step:4d} | training loss: {train_loss_value:.4f}")
+                # Save if this training loss improved
+                improved = train_loss_value < best_train_loss
+                if improved:
+                    best_train_loss = train_loss_value
+                    checkpoint_path_train = os.path.join(log_dir, "latest_checkpoint_train.pt")
+                    checkpoint_train = {
+                        'model': raw_model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'step': step,
+                        'best_train_loss': best_train_loss,
+                        'config': raw_model.config,
+                    }
+                    torch.save(checkpoint_train, checkpoint_path_train)
+                    print(f"Saved checkpoint to {checkpoint_path_train}")
     if ddp:
         destroy_process_group()    
