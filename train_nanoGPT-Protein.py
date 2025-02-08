@@ -10,6 +10,7 @@ import os
 import pandas as pd
 from pyfaidx import Fasta
 import datetime
+import numpy as np
 
 # -----------------------------------------------------------------------------
 
@@ -77,8 +78,8 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 4096  # Increase from 256 to handle longer sequences
-    vocab_size: int = 25
+    block_size: int = 1025
+    vocab_size: int = 33
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -166,141 +167,67 @@ class GPT(nn.Module):
 
 class DataLoaderLite:
 
-    def __init__(self, 
-                 B, T, 
-                 process_rank, num_processes, 
-                 bed_file='data/uniref50/bed_uniref50.bed', 
-                 fasta_file='data/uniref50/uniref50.fasta', 
-                 split='train'):
+    def __init__(self, B, T, process_rank, num_processes, split='train', data_dir='uniref50_shards'):
         self.B = B
-        self.T = T
+        self.T = T  # T should be 1024 for 1025-length sequences
         self.process_rank = process_rank
         self.num_processes = num_processes
-        self.master_process = (self.process_rank == 0)
-
-        # Prepare the Amino Acid -> integer mapping
-        self.chars = [
-            'A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L',
-            'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y',
-            'B', 'Z', 'X', 'U', 'O'
-        ]  # Includes standard and ambiguous amino acids
-        self.stoi = {ch: i for i, ch in enumerate(self.chars)}
-
-        # 1) Load BED and filter by split
-        df_bed = pd.read_csv(bed_file, sep='\t', header=None, names=['chrom','start','end','type'])
-        df_bed = df_bed[df_bed['type'] == split]
-        all_regions = df_bed[['chrom','start','end']].values.tolist()
-
-        # 2) Round-robin partitioning so each rank sees a disjoint subset of rows
-        #    e.g. rank 0 -> 0,2,4; rank 1 -> 1,3,5
-        self.my_rows = [i for i in range(len(all_regions)) if i % num_processes == process_rank]
-        self.regions = [all_regions[i] for i in self.my_rows]
-        self.num_regions = len(self.regions)
-
-        # 3) Open FASTA with pyfaidx
-        self.fasta = Fasta(fasta_file, 
-                           as_raw=True,
-                           read_ahead=False)  
-
-        # 4) Offsets: track how far we have consumed each region (local to this rank’s subset)
-        self.region_offsets = []
-        for (chrom, start, end) in self.regions:
-            self.region_offsets.append(start)
-
-        # 5) current_region_idx is local to our subset
-        self.current_region_idx = 0
-        self.cycle_through = True  # whether to loop back after the last region
-
+        self.split = split
+        self.data_dir = data_dir
+        self.master_process = (process_rank == 0)
+        
+        # List shard files that contain the split name in their filename
+        shards = [os.path.join(data_dir, f) for f in os.listdir(data_dir)
+                  if f.endswith('.npy') and f"{split}_" in f]
+        shards = sorted(shards)
+        self.shards = shards
+        self.num_shards = len(shards)
+        if self.master_process:
+            #print(f"Found {self.num_shards} shards for split '{split}' in {data_dir}")
+        self.reset()
+        #print(f"DataLoader initialized for process {process_rank}/{num_processes}")
+    
     def reset(self):
-        """ Reset iteration for this DataLoader's subset of regions. """
-        self.current_region_idx = 0
-        for i, (chrom, start, end) in enumerate(self.regions):
-            self.region_offsets[i] = start
-
-    def _get_region_sequence(self, chrom, start, end):
-        """
-        Use pyfaidx to fetch (start, end) from chrom, then convert to integer tokens via self.stoi.
-        With as_raw=True, self.fasta[chrom][start:end] is already a string.
-        """
-        seq_str = self.fasta[chrom][start:end]
-        return [self.stoi[c] for c in seq_str]
-
-    def _collect_batch_tokens(self, n_tokens_needed):
-        """
-        Collect up to n_tokens_needed from our local subset of regions.
-        If a region is partially used, continue exactly where left off.
-        """
-        collected = []
-
-        #print(f"[Rank {self.process_rank}] _collect_batch_tokens: need {n_tokens_needed} tokens")
-
-        while len(collected) < n_tokens_needed:
-            if self.current_region_idx >= self.num_regions:
-                # All regions are exhausted
-                if self.cycle_through:
-                    #print(f"[Rank {self.process_rank}] Wrapping around to region index 0. Resetting offsets.")
-                    # Reset all offsets to start processing regions again
-                    for i, (chrom, start, end) in enumerate(self.regions):
-                        self.region_offsets[i] = start
-                    self.current_region_idx = 0
-                else:
-                    #print(f"[Rank {self.process_rank}] No more regions to process. Breaking.")
-                    break
-
-            chrom, region_start, region_end = self.regions[self.current_region_idx]
-            offset = self.region_offsets[self.current_region_idx]
-            region_length = region_end - offset
-
-            if region_length <= 0:
-                #print(f"[Rank {self.process_rank}] Region {self.current_region_idx} fully consumed, next region.")
-                self.current_region_idx += 1
-                continue
-
-            needed = n_tokens_needed - len(collected)
-            fetch_end = min(offset + needed, region_end)
-
-            #print(f"[Rank {self.process_rank}] Fetch from {chrom}[{offset}:{fetch_end}] "
-            #    f"(needed={needed}, have={len(collected)})")
-
-            # Fetch tokens
-            region_tokens = self._get_region_sequence(chrom, offset, fetch_end)
-            collected.extend(region_tokens)
-
-            # Update offset
-            new_offset = offset + len(region_tokens)
-            self.region_offsets[self.current_region_idx] = new_offset
-
-            # If region is fully consumed, move on
-            if new_offset >= region_end:
-                #print(f"[Rank {self.process_rank}] Region {self.current_region_idx} consumed, advance.")
-                self.current_region_idx += 1
-
-        #print(f"[Rank {self.process_rank}] Finished collecting: {len(collected)} tokens.")
-        return collected
-
-
+        self.current_shard = 0
+        self.load_shard(self.current_shard)
+        self.current_index = self.process_rank
+    
+    def load_shard(self, shard_idx):
+        shard_path = self.shards[shard_idx]
+        self.shard_data = np.load(shard_path)
+        self.num_rows = self.shard_data.shape[0]
+        #print(f"Process {self.process_rank}: Loaded shard {shard_idx} ({shard_path}) with {self.num_rows} sequences")
+    
     def next_batch(self):
-        """
-        Returns x, y of shape (B, T).
-        We need B*T + 1 tokens total.
-        """
-        B, T = self.B, self.T
-        n_needed = B * T + 1
-
-        buf = self._collect_batch_tokens(n_needed)
-        if len(buf) < n_needed:
-            # attempt one reset
-            self.reset()
-            buf = self._collect_batch_tokens(n_needed)
-            if len(buf) < n_needed:
-                # if still short, return what we have or raise error
-                pass
-
-        buf = buf[:n_needed]
-        buf_t = torch.tensor(buf, dtype=torch.long)
-
-        x = buf_t[:-1].view(B, T)
-        y = buf_t[1:].view(B, T)
+        indices = []
+        for i in range(self.B):
+            idx = self.current_index + i * self.num_processes
+            if idx >= self.num_rows:
+                break
+            indices.append(idx)
+        
+        if len(indices) < self.B:
+            #print(f"Process {self.process_rank}: End of shard {self.current_shard}, switching to next shard")
+            self.current_shard = (self.current_shard + 1) % self.num_shards
+            self.load_shard(self.current_shard)
+            self.current_index = self.process_rank
+            indices = [self.current_index + i * self.num_processes for i in range(self.B)]
+        
+        #print(f"Process {self.process_rank}: Loading batch from shard {self.current_shard}")
+        #print(f"    Current index: {self.current_index}")
+        #print(f"    Batch indices: {indices[:5]}... (showing first 5)")
+        
+        batch = self.shard_data[indices]
+        x = torch.tensor(batch[:, :self.T], dtype=torch.long)
+        y = torch.tensor(batch[:, 1:], dtype=torch.long)
+        
+        self.current_index += self.B * self.num_processes
+        if self.current_index >= self.num_rows:
+            #print(f"Process {self.process_rank}: Reached end of shard {self.current_shard}, will switch on next batch")
+            self.current_shard = (self.current_shard + 1) % self.num_shards
+            self.load_shard(self.current_shard)
+            self.current_index = self.process_rank
+            
         return x, y
 
 # -----------------------------------------------------------------------------
@@ -355,14 +282,16 @@ if __name__ == "__main__":
     #total_batch_size = 589824  # Adjusted to be divisible by B * T * ddp_world_size, 48 * 1024 * 2
     total_batch_size = 1179648 #2**20 #2^20, ~1M, in number of tokens,  48 * 1024 * 2 * 12
     B = 48 # micro batch size
-    T = 1024 # sequence length
+    T = 1024
     assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank,
+                                  num_processes=ddp_world_size, split='train',
+                                  data_dir='uniref50_shards')
     #val_loader   = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="valid") #maybe clustering to build a proper val set later
 
     torch.set_float32_matmul_precision('high')
